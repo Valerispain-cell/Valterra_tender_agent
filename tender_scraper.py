@@ -101,7 +101,7 @@ def call_claude(prompt: str, max_tokens: int = 500) -> Optional[str]:
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
         json={
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-5",
             "max_tokens": max_tokens,
             "system": "You are VALTERRA Tender Intelligence Agent. Output only what is asked — no explanation, no markdown.",
             "messages": [{"role": "user", "content": prompt}],
