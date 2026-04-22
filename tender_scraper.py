@@ -1,7 +1,6 @@
 """
-VALTERRA Tender Intelligence Agent
-Runs 2x daily via GitHub Actions. Scrapes grain news sources,
-extracts tender data via Claude API, appends to Google Sheets.
+VALTERRA Tender Intelligence Agent v2
+Uses Google News RSS — не блокируется серверами GitHub Actions.
 """
 
 import os, json, time, hashlib, re
@@ -13,189 +12,118 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ── CONFIG ────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GOOGLE_CREDENTIALS = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; VALTERRA-Bot/1.0; grain market research)",
-    "Accept": "text/html,application/xhtml+xml",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
-
-# Target buyers — used in filter prompt and dedup
-TARGET_BUYERS = [
-    "GASC", "Mostakbal Misr", "TMO", "OAIC", "Jordan MIT",
-    "PASSCO", "TCP", "EGTE", "SAGO", "Tunisia", "Morocco",
-    "Bangladesh", "Philippines", "Saudi"
-]
 
 FILTER_KEYWORDS = [
     "tender", "purchase", "buy", "bought", "contracted", "no purchase",
     "tmo", "oaic", "gasc", "mostakbal", "jordan", "passco", "egte", "sago",
-    "algeria", "saudi", "ethiopia", "pakistan",
-    "wheat", "barley", "corn", "sorghum"
+    "algeria", "saudi", "ethiopia", "pakistan", "wheat", "barley", "corn", "grain"
 ]
 
-# ── SOURCES ───────────────────────────────────────────────────────────
 SOURCES = [
-    {
-        "name": "UkrAgroConsult",
-        "url": "https://ukragroconsult.com/en/news/",
-        "article_selector": "article a, .post-title a, h2 a, h3 a",
-        "base_url": "https://ukragroconsult.com",
-        "content_selector": ".entry-content, .post-content, article",
-    },
-    {
-        "name": "APK-Inform",
-        "url": "https://www.apk-inform.com/en/news",
-        "article_selector": ".news-item a, .title a, h2 a, h3 a",
-        "base_url": "https://www.apk-inform.com",
-        "content_selector": ".news-text, .article-body, article",
-    },
-    {
-        "name": "GrainCentral",
-        "url": "https://www.graincentral.com/markets/feed",
-        "is_rss": True,
-    },
-    {
-        "name": "WorldGrain",
-        "url": "https://www.world-grain.com/rss/grain-market-news",
-        "is_rss": True,
-    },
+    {"name": "GNews_GASC",     "url": "https://news.google.com/rss/search?q=GASC+wheat+tender+OR+Mostakbal+Misr+wheat&hl=en&gl=US&ceid=US:en",       "is_rss": True},
+    {"name": "GNews_TMO",      "url": "https://news.google.com/rss/search?q=TMO+Turkey+grain+tender+wheat+barley&hl=en&gl=US&ceid=US:en",              "is_rss": True},
+    {"name": "GNews_OAIC",     "url": "https://news.google.com/rss/search?q=OAIC+Algeria+wheat+tender&hl=en&gl=US&ceid=US:en",                         "is_rss": True},
+    {"name": "GNews_Jordan",   "url": "https://news.google.com/rss/search?q=Jordan+grain+tender+wheat+barley+purchased&hl=en&gl=US&ceid=US:en",        "is_rss": True},
+    {"name": "GNews_SAGO",     "url": "https://news.google.com/rss/search?q=SAGO+Saudi+Arabia+wheat+barley+tender&hl=en&gl=US&ceid=US:en",             "is_rss": True},
+    {"name": "GNews_Pakistan", "url": "https://news.google.com/rss/search?q=Pakistan+PASSCO+TCP+wheat+tender+import&hl=en&gl=US&ceid=US:en",           "is_rss": True},
+    {"name": "GNews_Ethiopia", "url": "https://news.google.com/rss/search?q=Ethiopia+EGTE+wheat+tender&hl=en&gl=US&ceid=US:en",                        "is_rss": True},
 ]
 
 
-# ── SCRAPING ──────────────────────────────────────────────────────────
 def fetch_html(url: str, timeout: int = 15) -> Optional[str]:
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
         r.raise_for_status()
         return r.text
     except Exception as e:
-        print(f"  [WARN] fetch failed {url}: {e}")
+        print(f"  [WARN] fetch failed {url[:80]}: {e}")
         return None
 
 
-def extract_article_links(html: str, source: dict) -> list[dict]:
-    """Extract article links from news index page."""
+def extract_article_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    links = []
-    seen = set()
-    for a in soup.select(source["article_selector"]):
-        href = a.get("href", "")
-        if not href:
-            continue
-        if not href.startswith("http"):
-            href = source["base_url"] + href
-        if href in seen:
-            continue
-        seen.add(href)
-        title = a.get_text(strip=True)
-        # Quick pre-filter on title
-        title_lower = title.lower()
-        if any(kw in title_lower for kw in FILTER_KEYWORDS):
-            links.append({"url": href, "title": title})
-    return links[:20]  # max 20 articles per source per run
-
-
-def parse_rss(xml: str, source_name: str) -> list[dict]:
-    """Parse RSS feed, return pre-filtered items."""
-    soup = BeautifulSoup(xml, "xml")
-    items = []
-    for item in soup.find_all("item")[:30]:
-        title = item.find("title")
-        link = item.find("link")
-        desc = item.find("description")
-        if not title or not link:
-            continue
-        title_text = title.get_text(strip=True)
-        desc_text = desc.get_text(strip=True) if desc else ""
-        combined = (title_text + " " + desc_text).lower()
-        if any(kw in combined for kw in FILTER_KEYWORDS):
-            items.append({
-                "url": link.get_text(strip=True),
-                "title": title_text,
-                "text": desc_text,
-                "source": source_name,
-            })
-    return items
-
-
-def extract_article_text(html: str, selector: str) -> str:
-    """Extract main text from article page."""
-    soup = BeautifulSoup(html, "html.parser")
-    # Try selector first
-    content = soup.select_one(selector)
-    if content:
-        return content.get_text(separator=" ", strip=True)[:3000]
-    # Fallback: largest text block
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
     paragraphs = soup.find_all("p")
     text = " ".join(p.get_text(strip=True) for p in paragraphs)
     return text[:3000]
 
 
-# ── CLAUDE API ────────────────────────────────────────────────────────
+def parse_rss(xml: str, source_name: str) -> list[dict]:
+    soup = BeautifulSoup(xml, "xml")
+    items = []
+    seen_urls = set()
+
+    for item in soup.find_all("item")[:20]:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        desc_el = item.find("description")
+        if not title_el:
+            continue
+
+        title_text = title_el.get_text(strip=True)
+        url = ""
+        if link_el:
+            url = link_el.get_text(strip=True)
+            if not url and link_el.next_sibling:
+                url = str(link_el.next_sibling).strip()
+
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        desc_text = desc_el.get_text(strip=True) if desc_el else ""
+        combined = (title_text + " " + desc_text).lower()
+        if not any(kw in combined for kw in FILTER_KEYWORDS):
+            continue
+
+        time.sleep(1.5)
+        article_html = fetch_html(url)
+        full_text = extract_article_text(article_html) if article_html else ""
+        text = full_text or desc_text or title_text
+
+        items.append({"url": url, "title": title_text, "text": text, "source": source_name})
+
+    return items
+
+
 def call_claude(prompt: str, max_tokens: int = 500) -> Optional[str]:
-    """Call Claude API, return text response."""
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
+        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
         json={
             "model": "claude-sonnet-4-20250514",
             "max_tokens": max_tokens,
-            "system": (
-                "You are VALTERRA Tender Intelligence Agent. "
-                "Monitor grain news and extract tender data for commodity brokerage. "
-                "Output only what is asked — no explanation, no markdown."
-            ),
+            "system": "You are VALTERRA Tender Intelligence Agent. Output only what is asked — no explanation, no markdown.",
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=30,
     )
     if r.status_code != 200:
-        print(f"  [ERROR] Claude API: {r.status_code} {r.text[:200]}")
+        print(f"  [ERROR] Claude API: {r.status_code}")
         return None
     return r.json()["content"][0]["text"].strip()
 
 
-FILTER_PROMPT = """You are a grain market news classifier.
-
-Classify if this news article is about a COMPLETED or ANNOUNCED 
-international grain tender from a STATE buyer.
-
+FILTER_PROMPT = """Classify if this news article is about a COMPLETED or ANNOUNCED international grain tender from a STATE buyer.
 Return ONLY: "YES" or "NO"
 
-Rules for YES:
-- Mentions a state grain buyer (GASC, Mostakbal Misr, TMO, OAIC, 
-  Jordan MIT, PASSCO, TCP, EGTE, SAGO, Saudi, Algeria, Tunisia, 
-  Morocco, Bangladesh, Philippines, Iran)
-- About a tender result (purchased, bought, contracted, no purchase, 
-  failed) OR new tender announcement with volume + price
-- Involves physical grain (wheat, barley, corn, sorghum, soybeans)
+YES if: state grain buyer (GASC, Mostakbal Misr, TMO, OAIC, Jordan MIT, PASSCO, TCP, EGTE, SAGO, Saudi, Algeria) + tender result or announcement + physical grain.
+NO if: domestic procurement, price analysis, weather, futures.
 
-Rules for NO:
-- Domestic procurement from local farmers
-- Price forecasts or analysis without specific tender
-- Logistics, weather, crop reports
-- Futures / financial instruments
+Article: \"\"\"{text}\"\"\""""
 
-Article:
-\"\"\"{text}\"\"\"
-"""
+EXTRACT_PROMPT = """Extract grain tender data. Return ONLY valid JSON, no markdown.
 
-EXTRACT_PROMPT = """You are a grain market data extraction specialist.
-Extract structured data from this grain tender news article.
-
-Return ONLY valid JSON. No explanation, no markdown, no extra text.
-If a field cannot be determined with confidence, use null.
-
-JSON structure:
 {{
   "date": "YYYY-MM-DD",
   "buyer": "",
@@ -208,7 +136,6 @@ JSON structure:
   "price_usd_t": null,
   "price_range": null,
   "basis": "",
-  "port": "",
   "origin": "",
   "shipment_from": "YYYY-MM-DD",
   "shipment_to": "YYYY-MM-DD",
@@ -220,20 +147,10 @@ JSON structure:
   "confidence": "high or medium or low"
 }}
 
-Rules:
-- date: when tender was HELD, not article published
-- buyer: use exact names: GASC | Mostakbal Misr | TMO | OAIC | Jordan MIT | PASSCO | TCP | EGTE | SAGO
-- volume_bought_t: often half of volume_sought_t (e.g. sought 120k, bought 60k)
-- price_usd_t: WINNING price only, not average of all offers
-- origin "optional" or "any origin" → use "optional"
-- no_purchase: volume_bought_t=0, price_usd_t=null, winning_trader=null
-- confidence: high=all key fields present, medium=price or volume missing, low=buyer+commodity only
+Rules: date=tender date (not publish date), buyer=exact name (GASC|TMO|OAIC|Jordan MIT|SAGO|PASSCO|TCP|EGTE), price_usd_t=winning price only, origin "any"="optional", confidence high=all fields present.
 
-Article:
-\"\"\"{text}\"\"\"
-
-Source URL: {url}
-"""
+Article: \"\"\"{text}\"\"\"
+Source URL: {url}"""
 
 
 def is_tender_article(text: str) -> bool:
@@ -245,46 +162,30 @@ def extract_tender(text: str, url: str) -> Optional[dict]:
     raw = call_claude(EXTRACT_PROMPT.format(text=text[:2500], url=url), max_tokens=800)
     if not raw:
         return None
-    # Clean potential markdown fences
-    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    raw = re.sub(r"```(?:json)?|```", "", raw).strip()
     try:
         data = json.loads(raw)
-        # Basic validation
         if not data.get("buyer") or not data.get("commodity"):
             return None
         if data.get("confidence") == "low":
             return None
         return data
     except json.JSONDecodeError as e:
-        print(f"  [WARN] JSON parse error: {e} | raw: {raw[:200]}")
+        print(f"  [WARN] JSON parse: {e} | {raw[:100]}")
         return None
 
 
-# ── GOOGLE SHEETS ─────────────────────────────────────────────────────
-SHEET_COLUMNS = [
-    "id", "scraped_at", "date", "buyer", "country", "type",
-    "commodity", "commodity_spec",
-    "volume_sought_t", "volume_bought_t",
-    "price_usd_t", "price_range", "basis", "port", "origin",
-    "shipment_from", "shipment_to",
-    "winning_trader", "other_offers",
-    "result", "payment_terms",
-    "source_name", "source_url", "confidence"
-]
+SHEET_COLUMNS = ["id","scraped_at","date","buyer","country","type","commodity","commodity_spec",
+                 "volume_sought_t","volume_bought_t","price_usd_t","price_range","basis","origin",
+                 "shipment_from","shipment_to","winning_trader","other_offers","result",
+                 "payment_terms","source_name","source_url","confidence"]
 
 
 def get_sheet():
-    creds = Credentials.from_service_account_info(
-        GOOGLE_CREDENTIALS,
-        scopes=[
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
+    creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS,
+        scopes=["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"])
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
-
-    # Ensure raw_tenders sheet exists
     try:
         ws = sh.worksheet("raw_tenders")
     except gspread.WorksheetNotFound:
@@ -294,136 +195,81 @@ def get_sheet():
     return ws
 
 
-def make_row_id(date: str, buyer: str, commodity: str, volume: Optional[int]) -> str:
-    key = f"{date}|{buyer}|{commodity}|{volume or 0}"
-    return hashlib.md5(key.encode()).hexdigest()[:12]
+def make_row_id(date, buyer, commodity, volume):
+    return hashlib.md5(f"{date}|{buyer}|{commodity}|{volume or 0}".encode()).hexdigest()[:12]
 
 
 def get_existing_ids(ws) -> set:
     try:
-        ids = ws.col_values(1)  # column A = id
-        return set(ids[1:])     # skip header
+        return set(ws.col_values(1)[1:])
     except Exception:
         return set()
 
 
 def append_tender(ws, data: dict, source_name: str, existing_ids: set) -> bool:
-    row_id = make_row_id(
-        data.get("date", ""),
-        data.get("buyer", ""),
-        data.get("commodity", ""),
-        data.get("volume_sought_t"),
-    )
+    row_id = make_row_id(data.get("date",""), data.get("buyer",""), data.get("commodity",""), data.get("volume_sought_t"))
     if row_id in existing_ids:
-        return False  # duplicate
-
-    other_offers_str = json.dumps(data.get("other_offers") or [])
-    row = [
-        row_id,
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        data.get("date", ""),
-        data.get("buyer", ""),
-        data.get("country", ""),
-        data.get("type", ""),
-        data.get("commodity", ""),
-        data.get("commodity_spec", ""),
-        data.get("volume_sought_t", ""),
-        data.get("volume_bought_t", ""),
-        data.get("price_usd_t", ""),
-        data.get("price_range", ""),
-        data.get("basis", ""),
-        data.get("port", ""),
-        data.get("origin", ""),
-        data.get("shipment_from", ""),
-        data.get("shipment_to", ""),
-        data.get("winning_trader", ""),
-        other_offers_str,
-        data.get("result", ""),
-        data.get("payment_terms", ""),
-        source_name,
-        data.get("source_url", ""),
-        data.get("confidence", ""),
-    ]
+        return False
+    row = [row_id, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+           data.get("date",""), data.get("buyer",""), data.get("country",""), data.get("type",""),
+           data.get("commodity",""), data.get("commodity_spec",""), data.get("volume_sought_t",""),
+           data.get("volume_bought_t",""), data.get("price_usd_t",""), data.get("price_range",""),
+           data.get("basis",""), data.get("origin",""), data.get("shipment_from",""),
+           data.get("shipment_to",""), data.get("winning_trader",""),
+           json.dumps(data.get("other_offers") or []), data.get("result",""),
+           data.get("payment_terms",""), source_name, data.get("source_url",""), data.get("confidence","")]
     ws.append_row(row, value_input_option="USER_ENTERED")
     existing_ids.add(row_id)
     return True
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────
 def run():
     print(f"\n{'='*60}")
-    print(f"VALTERRA Tender Agent — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"VALTERRA Tender Agent v2 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*60}\n")
 
     ws = get_sheet()
     existing_ids = get_existing_ids(ws)
-    print(f"Existing records in sheet: {len(existing_ids)}\n")
+    print(f"Existing records: {len(existing_ids)}\n")
 
-    total_found = 0
-    total_added = 0
+    total_found = total_added = 0
 
     for source in SOURCES:
-        print(f"── Source: {source['name']} ──────────────────")
+        print(f"── {source['name']} ──────────────")
         html = fetch_html(source["url"])
         if not html:
             continue
 
-        # Get articles
-        if source.get("is_rss"):
-            articles = parse_rss(html, source["name"])
-        else:
-            links = extract_article_links(html, source)
-            articles = []
-            for link in links:
-                time.sleep(1.5)  # polite delay
-                article_html = fetch_html(link["url"])
-                if article_html:
-                    text = extract_article_text(
-                        article_html, source["content_selector"]
-                    )
-                    articles.append({
-                        "url": link["url"],
-                        "title": link["title"],
-                        "text": text,
-                        "source": source["name"],
-                    })
-
+        articles = parse_rss(html, source["name"])
         print(f"  Articles to check: {len(articles)}")
 
         for article in articles:
             text = article.get("text") or article.get("title", "")
             url = article["url"]
 
-            # Step 1: filter
             if not is_tender_article(text):
                 continue
 
             total_found += 1
-            print(f"  ✓ Tender article: {article['title'][:60]}...")
+            print(f"  ✓ {article['title'][:60]}...")
 
-            # Step 2: extract
             time.sleep(1)
             data = extract_tender(text, url)
             if not data:
-                print(f"    → extraction failed or low confidence")
+                print(f"    → extraction failed")
                 continue
 
-            # Step 3: save
             added = append_tender(ws, data, source["name"], existing_ids)
             if added:
                 total_added += 1
-                print(f"    → ADDED: {data.get('buyer')} | {data.get('commodity')} | "
-                      f"{data.get('price_usd_t')} {data.get('basis')} | "
-                      f"{data.get('result')}")
+                print(f"    → ADDED: {data.get('buyer')} | {data.get('commodity')} | ${data.get('price_usd_t')} {data.get('basis')} | {data.get('result')}")
             else:
-                print(f"    → DUPLICATE, skipped")
-
+                print(f"    → duplicate")
             time.sleep(1)
-
         print()
 
     print(f"{'='*60}")
-    print(f"Run complete. Found: {total_found} | Added: {total_added}")
+    print(f"Done. Found: {total_found} | Added: {total_added}")
     print(f"{'='*60}\n")
 
 
